@@ -9,8 +9,10 @@ SPDX-License-Identifier: GPL-3.0-or-later
 
 # uses the psf/black style
 
+import io
 import json
 import math
+import struct
 import subprocess
 from pathlib import Path
 
@@ -47,6 +49,119 @@ def _iter_lcd_animation(path):
         while True:
             for image in ImageSequence.Iterator(animation):
                 yield _prepare_lcd_image(image), max(image.info.get("duration", 100), 20) / 1000
+
+
+def _encode_lcd_jpeg(image):
+    """Encode a Pillow image as the baseline 640×480 JPEG the cooler stores."""
+    buf = io.BytesIO()
+    image.convert("RGB").resize(_LCD_RESOLUTION).save(
+        buf, "JPEG", quality=90, subsampling="4:2:0", progressive=False, optimize=False
+    )
+    return buf.getvalue()
+
+
+def _prepare_lcd_stored_image(path):
+    """Load an image file and encode it for storage in the cooler's memory."""
+    with Image.open(path) as image:
+        return _encode_lcd_jpeg(image)
+
+
+def _build_mjpeg_avi(frames, fps):
+    """Wrap JPEG frames in the Motion JPEG AVI container the cooler plays back.
+
+    The layout deliberately mirrors the files uploaded by the vendor software
+    (which are written by FFmpeg), including their padding chunks, so that the
+    frame data starts at the same offset.  The cooler's player has only been
+    validated with this layout.
+    """
+    width, height = _LCD_RESOLUTION
+    largest = max(len(frame) for frame in frames)
+
+    def chunk(fourcc, data):
+        return fourcc + struct.pack("<I", len(data)) + data + (b"\0" if len(data) % 2 else b"")
+
+    def riff_list(kind, data):
+        return b"LIST" + struct.pack("<I", len(data) + 4) + kind + data
+
+    avih = struct.pack(
+        "<14I",
+        1_000_000 // fps,  # microseconds per frame
+        largest * fps,  # maximum bytes per second
+        0,  # padding granularity
+        0x910,  # AVIF_HASINDEX | AVIF_ISINTERLEAVED | AVIF_TRUSTCKTYPE
+        len(frames),
+        0,  # initial frames
+        1,  # streams
+        0x100000,  # suggested buffer size
+        width,
+        height,
+        0,
+        0,
+        0,
+        0,
+    )
+    strh = struct.pack(
+        "<4s4sIHHIIIIIIII4h",
+        b"vids",
+        b"MJPG",
+        0,  # flags
+        0,  # priority
+        0,  # language
+        0,  # initial frames
+        1,  # scale
+        fps,  # rate
+        0,  # start
+        len(frames),
+        largest,  # suggested buffer size
+        0xFFFFFFFF,  # quality
+        0,  # sample size
+        0,
+        0,
+        width,
+        height,
+    )
+    strf = struct.pack(
+        "<IiiHH4sIiiII", 40, width, height, 1, 24, b"MJPG", width * height * 3, 0, 0, 0, 0
+    )
+    # space FFmpeg reserves for an OpenDML index and header, left unused
+    index_reserve = (struct.pack("<I", 4) + bytes(4) + b"00dc").ljust(4120, b"\0")
+    header_reserve = (b"odmldmlh" + struct.pack("<I", 248)).ljust(260, b"\0")
+    strl = riff_list(
+        b"strl", chunk(b"strh", strh) + chunk(b"strf", strf) + chunk(b"JUNK", index_reserve)
+    )
+    hdrl = riff_list(b"hdrl", chunk(b"avih", avih) + strl + chunk(b"JUNK", header_reserve))
+    info = riff_list(b"INFO", chunk(b"ISFT", b"liquidctl".ljust(14, b"\0")))
+
+    movi = b""
+    index = b""
+    for frame in frames:
+        # index offsets are relative to the "movi" fourcc
+        index += struct.pack("<4sIII", b"00dc", 0x10, len(movi) + 4, len(frame))
+        movi += chunk(b"00dc", frame)
+
+    body = (
+        b"AVI "
+        + hdrl
+        + info
+        + chunk(b"JUNK", bytes(1016))
+        + riff_list(b"movi", movi)
+        + chunk(b"idx1", index)
+    )
+    return b"RIFF" + struct.pack("<I", len(body)) + body
+
+
+def _prepare_lcd_stored_animation(path):
+    """Convert an animated image to a Motion JPEG AVI for storage in the cooler's memory."""
+    with Image.open(path) as animation:
+        if not getattr(animation, "is_animated", False):
+            raise ValueError("GIF mode requires an animated image")
+        frames = []
+        durations = []
+        for image in ImageSequence.Iterator(animation):
+            frames.append(_encode_lcd_jpeg(image))
+            durations.append(max(image.info.get("duration", 100), 20))
+    fps = max(1, min(30, round(1000 * len(durations) / sum(durations))))
+    return _build_mjpeg_avi(frames, fps)
 
 
 def _iter_lcd_background(path):

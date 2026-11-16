@@ -95,8 +95,7 @@ To rotate through the cooler statistics with the default dashboard, run:
 
 The first argument is an optional six-digit RGB font colour shorthand (default:
 `B300FF`); the second is an optional page interval in seconds (default: `5`).
-The display runs until Ctrl+C.  Display brightness and orientation controls
-are not supported.
+The display runs until Ctrl+C.  Display orientation control is not supported.
 
 For a configurable dashboard, pass a JSON file instead:
 
@@ -133,3 +132,53 @@ The leading `#` is optional.
 
 Set `background` to an image or animated GIF.  Relative paths are resolved
 from the JSON file's directory.
+
+### Modes handled by the cooler itself
+
+The `static`, `gif` and `stats` modes above are drawn by the host and streamed
+to the cooler, so they need liquidctl to keep running.  The following modes
+are handled by the cooler's firmware instead: the command returns immediately
+and the display keeps its contents for as long as the cooler has power.
+
+Store an image or an animated GIF in the cooler's memory and display it:
+
+```
+# liquidctl set lcd screen stored-static /path/to/image.png
+# liquidctl set lcd screen stored-gif /path/to/animation.gif
+```
+
+Images are converted to a 640×480 JPEG and animations to a 640×480 Motion JPEG
+AVI, the formats the vendor software uploads.  Omit the path to switch back to
+the file already stored:
+
+```
+# liquidctl set lcd screen stored-gif
+```
+
+The cooler does not keep the stored files across a full power cycle (they do
+survive a warm reboot), so they have to be uploaded again after the computer
+is switched on.
+
+Replacing an animation that is currently playing blanks the display for a
+moment, because the cooler refuses to overwrite a file it is playing.  If an
+upload is interrupted, upload the file again before selecting it: showing an
+incomplete animation can hang the cooler's player until the next power cycle.
+
+Set the display brightness, from 0 to 100, or turn the display off:
+
+```
+# liquidctl set lcd screen brightness 60
+# liquidctl set lcd screen off
+```
+
+Any other screen mode turns the display back on.  Brightness is remembered by
+the cooler.
+
+Show a label and a value using the cooler's built-in text layout:
+
+```
+# liquidctl set lcd screen text "CPU=54°C"
+```
+
+The label is limited to 18 bytes.  To keep the value current, run the command
+again with a new value.

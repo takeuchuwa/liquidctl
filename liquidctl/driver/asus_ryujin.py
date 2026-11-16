@@ -21,10 +21,12 @@ from liquidctl.driver.asus_ryujin_lcd import (
     _load_lcd_static_background,
     _load_lcd_stats_config,
     _prepare_lcd_frame,
+    _prepare_lcd_stored_animation,
+    _prepare_lcd_stored_image,
     _read_lcd_custom_stats,
     _render_lcd_stats,
 )
-from liquidctl.error import ExpectationNotMet, NotSupportedByDriver
+from liquidctl.error import ExpectationNotMet, NotSupportedByDriver, Timeout
 from liquidctl.util import clamp, u16le_from, rpadlist, fraction_of_byte
 
 _LOGGER = logging.getLogger(__name__)
@@ -56,6 +58,34 @@ _LCD_PRODUCT_ID = 0x1BCB
 _LCD_RAW_FRAMEBUFFER_MODE = 0x20
 _LCD_BULK_OUT_ENDPOINT = 0x02
 _LCD_TRANSFER_TIMEOUT_MS = 10_000
+
+# Display modes handled by the cooler's own firmware.  Unlike the raw
+# framebuffer mode, these keep working after the host program exits.
+_NOTIFY_PREFIX = 0xEE
+_LCD_MODE_OFF = 0x00
+_LCD_MODE_STORED_IMAGE = 0x11
+_LCD_MODE_STORED_VIDEO = 0x14
+_LCD_MODE_TEXT = 0x1F
+_LCD_STORED_BLOCK_SIZE = 4096
+_LCD_STORED_SLOTS = {
+    _LCD_MODE_STORED_IMAGE: [0x01, 0x01],
+    _LCD_MODE_STORED_VIDEO: [0x01],
+}
+_LCD_STORED_LAYOUT = {
+    _LCD_MODE_STORED_IMAGE: 0x05,
+    _LCD_MODE_STORED_VIDEO: 0x01,
+}
+_LCD_TEXT_LABEL_LENGTH = 18
+_LCD_TEXT_VALUE_LENGTH = 40
+_LCD_NOTIFY_TIMEOUT_MS = 10_000
+# The cooler needs time to prepare its storage after the file size is
+# announced; without it the first block of a larger file is never acknowledged.
+_LCD_STORED_PREPARE_DELAY = 1.0
+# A video that was playing is released a moment after the display mode
+# changes; until then the cooler refuses to open a transfer for it.
+_LCD_STORED_OPEN_ATTEMPTS = 6
+_LCD_STORED_RETRY_DELAY = 0.5
+_LCD_MODE_CHANGE_TIMEOUT = 3.0
 
 
 class AsusRyujin(UsbHidDriver):
@@ -258,12 +288,24 @@ class AsusRyujin(UsbHidDriver):
         | `lcd` | `static` | path to image |
         | `lcd` | `gif` | path to animated GIF (plays until interrupted) |
         | `lcd` | `stats` | path to JSON configuration, or RGB hex shorthand |
+        | `lcd` | `brightness` | integer between `0` and `100` |
+        | `lcd` | `off` | |
+        | `lcd` | `stored-static` | path to image, or nothing to show the stored one |
+        | `lcd` | `stored-gif` | path to animated GIF, or nothing to show the stored one |
+        | `lcd` | `text` | `LABEL=VALUE` shown by the cooler's own text layout |
+
+        The `static`, `gif` and `stats` modes are rendered by the host and
+        streamed to the cooler for as long as the command runs.  The
+        `stored-*` and `text` modes are handled by the cooler's firmware and
+        stay on screen after the command returns, until the cooler loses power.
         """
         if self.product_id != _LCD_PRODUCT_ID:
             raise NotSupportedByDriver()
         if channel.lower() != "lcd":
             raise ValueError(f"invalid channel: {channel}")
         mode = mode.lower()
+        if mode in ("brightness", "off", "stored-static", "stored-gif", "text"):
+            return self._set_firmware_screen(mode, value)
         if mode not in ("static", "gif", "stats"):
             raise ValueError(f"invalid mode: {mode}")
 
@@ -442,6 +484,152 @@ class AsusRyujin(UsbHidDriver):
         )
         if written is not None and written != len(frame):
             raise RuntimeError(f"short LCD bulk write: {written} of {len(frame)} bytes")
+
+    def _set_firmware_screen(self, mode, value):
+        if mode == "brightness":
+            if value is None:
+                raise ValueError("brightness requires a value between 0 and 100")
+            self._set_lcd_brightness(clamp(int(value), 0, 100))
+        elif mode == "off":
+            self._command([0x51, _LCD_MODE_OFF], 0x51)
+        elif mode == "text":
+            label, separator, text = (value or "").partition("=")
+            if not separator:
+                raise ValueError("text mode requires a value in the form LABEL=VALUE")
+            self._show_lcd_text(label, text)
+        else:
+            lcd_mode = _LCD_MODE_STORED_IMAGE if mode == "stored-static" else _LCD_MODE_STORED_VIDEO
+            if value is not None:
+                try:
+                    if lcd_mode == _LCD_MODE_STORED_IMAGE:
+                        data = _prepare_lcd_stored_image(value)
+                    else:
+                        data = _prepare_lcd_stored_animation(value)
+                except (OSError, ValueError) as err:
+                    raise ValueError(f"invalid {mode} configuration: {err}") from err
+                self._store_lcd_file(data, _LCD_STORED_SLOTS[lcd_mode])
+            self._show_lcd_stored(lcd_mode)
+            if not self._wait_lcd_mode(lcd_mode):
+                # Seen with a video the cooler's player cannot parse (or an
+                # empty one): the display mode never changes and further
+                # videos are refused until the cooler is power cycled.
+                _LOGGER.error("the cooler did not start showing the stored file")
+                raise ExpectationNotMet()
+
+    def _set_lcd_brightness(self, brightness):
+        # The vendor software always reads the settings before writing them.
+        self._command([0xDC], 0x5C)
+        self._command(
+            [0x5C, 0x01, 0, 0, brightness, 0, 0, 0, brightness, 0x14, 0, 0, 0, 0, brightness, 0x14],
+            0x5C,
+        )
+
+    def _show_lcd_text(self, label, text):
+        label = list(label.encode()[:_LCD_TEXT_LABEL_LENGTH])
+        text = list(text.encode()[:_LCD_TEXT_VALUE_LENGTH])
+        white = [0xFF, 0xFF, 0xFF]
+        self._command([0x5F, 0, 0, *rpadlist(label, _LCD_TEXT_LABEL_LENGTH, 0), *text], 0x5F)
+        self._command(
+            [0x5E, 0, 0, 0, 0, 1, 1, *white, 0, *white, 1, *white, 0, *white, 1, *white, 0, *white],
+            0x5E,
+        )
+        self._command([0x5D, 0x00, 0x01, 0x21, 0x00, 0x01, 0x00, 0x00, 0x05], 0x5D)
+        self._command([0x51, _LCD_MODE_TEXT], 0x51)
+
+    def _get_lcd_mode(self):
+        return self._command([0xD0], 0x50)[5]
+
+    def _wait_lcd_mode(self, lcd_mode):
+        """Wait for a display mode change, which takes a few tenths of a second."""
+        deadline = time.monotonic() + _LCD_MODE_CHANGE_TIMEOUT
+        while self._get_lcd_mode() != lcd_mode:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.1)
+        return True
+
+    def _show_lcd_stored(self, lcd_mode):
+        self._command(
+            [0x5D, 0x00, 0x01, lcd_mode, 0x01, 0x00, 0x00, 0x00, _LCD_STORED_LAYOUT[lcd_mode]],
+            0x5D,
+        )
+        self._command([0x51, lcd_mode, 0x01], 0x51)
+
+    def _store_lcd_file(self, data, slot):
+        """Write a JPEG or Motion JPEG AVI file to the cooler's own storage."""
+        bulk_device = self._open_bulk_device()
+        in_transfer = False
+        try:
+            # The stored video cannot be replaced while it is playing.
+            if self._get_lcd_mode() == _LCD_MODE_STORED_VIDEO:
+                self._command([0x51, _LCD_MODE_OFF], 0x51)
+                time.sleep(_LCD_STORED_RETRY_DELAY)
+
+            for attempt in range(_LCD_STORED_OPEN_ATTEMPTS):
+                self._command([0x71, 0x01, 0x01], 0x71)
+                self._wait_report(_NOTIFY_PREFIX, 0x12)
+                self._command([0xF1], 0x71)
+                self._command([0x72, *slot], 0x72)
+                self._command([0x73, 0x01], 0x73)
+                in_transfer = True
+                if self._wait_report(_NOTIFY_PREFIX, 0x13)[2] == 0:
+                    break
+                # refused: the file is untouched, so closing and retrying is safe
+                self._close_lcd_transfer()
+                in_transfer = False
+                time.sleep(_LCD_STORED_RETRY_DELAY)
+            else:
+                _LOGGER.error("the cooler refused the LCD file transfer")
+                raise ExpectationNotMet()
+
+            self._command([0x7F, 0x02, *len(data).to_bytes(3, byteorder="little")], 0x7F)
+            time.sleep(_LCD_STORED_PREPARE_DELAY)
+            for offset in range(0, len(data), _LCD_STORED_BLOCK_SIZE):
+                block = data[offset : offset + _LCD_STORED_BLOCK_SIZE]
+                block = block.ljust(_LCD_STORED_BLOCK_SIZE, b"\0")
+                written = bulk_device.write(
+                    _LCD_BULK_OUT_ENDPOINT, block, timeout=_LCD_TRANSFER_TIMEOUT_MS
+                )
+                if written is not None and written != len(block):
+                    raise RuntimeError(f"short LCD bulk write: {written} of {len(block)} bytes")
+                self._wait_report(_NOTIFY_PREFIX, 0x14)
+            self._close_lcd_transfer()
+            in_transfer = False
+        finally:
+            # An open transfer must be closed, but only an open one: ending a
+            # transfer that was never started makes the cooler reboot.
+            if in_transfer:
+                try:
+                    self._close_lcd_transfer()
+                except (ExpectationNotMet, Timeout):
+                    _LOGGER.warning("could not close the LCD file transfer")
+            self._close_bulk_device(bulk_device)
+
+    def _close_lcd_transfer(self):
+        self._command([0x73, 0xFF], 0x73)
+        self._wait_report(_NOTIFY_PREFIX, 0x13)
+
+    def _command(self, data: List[int], response_header: int) -> List[int]:
+        """Send a command and wait for its reply, skipping unrelated reports."""
+        self.device.clear_enqueued_reports()
+        self._write([_PREFIX, *data])
+        return self._wait_report(_PREFIX, response_header)
+
+    def _wait_report(self, prefix: int, header: int):
+        """Read reports until one with the given prefix and header arrives.
+
+        Replies to other software polling the cooler (for example the kernel
+        hwmon driver) share the same interface and are skipped.
+        """
+        deadline = time.monotonic() + _LCD_NOTIFY_TIMEOUT_MS / 1000
+        while True:
+            remaining = int((deadline - time.monotonic()) * 1000)
+            if remaining <= 0:
+                _LOGGER.debug("no %02x %02x report from the cooler", prefix, header)
+                raise Timeout()
+            msg = self.device.read(_REPORT_LENGTH, timeout=remaining)
+            if msg and msg[0] == prefix and msg[1] == header:
+                return msg
 
     def _request(self, request_header: int, response_header: int) -> List[int]:
         self.device.clear_enqueued_reports()

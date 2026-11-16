@@ -1,6 +1,6 @@
 import pytest
 
-from _testutils import MockHidapiDevice, MockPyusbDevice
+from _testutils import MockHidapiDevice, MockPyusbDevice, Report
 
 import json
 from types import SimpleNamespace
@@ -9,13 +9,17 @@ from PIL import Image, ImageDraw
 
 import liquidctl.driver.asus_ryujin_lcd as asus_ryujin_lcd
 from liquidctl.driver.asus_ryujin import AsusRyujin
+from liquidctl.error import ExpectationNotMet, Timeout
 from liquidctl.driver.asus_ryujin_lcd import (
+    _build_mjpeg_avi,
     _format_lcd_value,
     _iter_lcd_animation,
     _load_lcd_stats_config,
     _load_lcd_static_background,
     _parse_lcd_color,
     _prepare_lcd_frame,
+    _prepare_lcd_stored_animation,
+    _prepare_lcd_stored_image,
     _read_lcd_custom_stats,
     _render_lcd_stats,
 )
@@ -31,6 +35,16 @@ CMD_SET_FAN_DUTY = 0x21
 CMD_GET_LCD_MODE = 0xD0
 CMD_SET_LCD_MODE = 0x51
 CMD_ANNOUNCE_LCD_FRAME = 0x7F
+CMD_GET_LCD_SETTINGS = 0xDC
+CMD_SET_LCD_SETTINGS = 0x5C
+CMD_SET_LCD_LAYOUT = 0x5D
+CMD_SET_LCD_TEXT_STYLE = 0x5E
+CMD_SET_LCD_TEXT = 0x5F
+CMD_LCD_STORAGE_OPEN = 0x71
+CMD_LCD_STORAGE_INFO = 0xF1
+CMD_LCD_STORAGE_SLOT = 0x72
+CMD_LCD_TRANSFER = 0x73
+NOTIFY_HEADER = 0xEE
 DEVICE_CONFIGS = {
     0x1988: {
         "name": "Mock ASUS Ryujin II",
@@ -75,6 +89,22 @@ DEVICE_CONFIGS = {
             CMD_GET_PUMP_DUTY: "ec1a00011e1e",
             CMD_GET_LCD_MODE: "ec50000131140000",
             CMD_SET_PUMP_DUTY: "ec1a",
+            # replies and notifications captured from a real cooler
+            CMD_SET_LCD_MODE: "ec51",
+            CMD_GET_LCD_SETTINGS: "ec5c0000003c0000003c14000000003c14",
+            CMD_SET_LCD_SETTINGS: "ec5c",
+            CMD_SET_LCD_LAYOUT: "ec5d",
+            CMD_SET_LCD_TEXT_STYLE: "ec5e",
+            CMD_SET_LCD_TEXT: "ec5f",
+            CMD_LCD_STORAGE_OPEN: "ec71",
+            CMD_LCD_STORAGE_INFO: "ec710001e0fe000018f70000200f0000002007",
+            CMD_LCD_STORAGE_SLOT: "ec72",
+            CMD_LCD_TRANSFER: "ec73",
+            CMD_ANNOUNCE_LCD_FRAME: "ec7f000010",
+        },
+        "notifications": {
+            CMD_LCD_STORAGE_OPEN: "ee12",
+            CMD_LCD_TRANSFER: "ee13",
         },
         "expected_firmware": "AURJ3-S5F9-0104",
         "expected_status": [
@@ -159,6 +189,9 @@ class _MockRyujinDevice(MockHidapiDevice):
         super().__init__(vendor_id, product_id)
         self.requests = []
         self.response = None
+        self.lcd_mode = None
+        self.player_hangs = False
+        self.refuse_transfers = 0
         self.config = DEVICE_CONFIGS.get(product_id, {})
 
     def write(self, data):
@@ -169,6 +202,16 @@ class _MockRyujinDevice(MockHidapiDevice):
         command = data[1]
 
         self.response = self.config.get("responses", {}).get(command)
+        self.notification = self.config.get("notifications", {}).get(command)
+        self.replied = False
+
+        if command == CMD_SET_LCD_MODE and not self.player_hangs:
+            self.lcd_mode = data[2]
+        if command == CMD_GET_LCD_MODE and self.lcd_mode is not None:
+            self.response = f"ec50000131{self.lcd_mode:02x}010001"
+        if command == CMD_LCD_TRANSFER and data[2] == 0x01 and self.refuse_transfers > 0:
+            self.refuse_transfers -= 1
+            self.notification = "ee131001"
 
     def read(self, length, **kwargs):
         pre = super().read(length, **kwargs)
@@ -177,6 +220,14 @@ class _MockRyujinDevice(MockHidapiDevice):
 
         buf = bytearray(65)
         buf[0] = PROTOCOL_HEADER
+
+        # the cooler follows some replies with an unsolicited notification
+        if self.replied and self.notification:
+            notification = bytes.fromhex(self.notification)
+            buf[: len(notification)] = notification
+            self.notification = None
+            return buf[:length]
+        self.replied = True
 
         if self.response:
             response = bytes.fromhex(self.response)
@@ -241,6 +292,265 @@ def test_set_static_screen_uses_validated_lcd_sequence(mock_ryujin3, tmp_path):
     assert endpoint == 0x02
     assert len(frame) == 640 * 480 * 3
     assert frame[:3] == bytes((255, 0, 0))
+
+
+class _AcknowledgingBulkDevice(MockPyusbDevice):
+    """Bulk interface whose writes are acknowledged on the HID interface."""
+
+    def __init__(self, hid_device, **kwargs):
+        super().__init__(**kwargs)
+        self.hid_device = hid_device
+
+    def write(self, endpoint, data, **kwargs):
+        super().write(endpoint, data, **kwargs)
+        self.hid_device.preload_read(Report(NOTIFY_HEADER, [0x14, 0x00, 0x00, 0x10]))
+        return len(data)
+
+
+def _lcd_requests(device):
+    """Return sent reports with their zero padding removed."""
+    return [bytes(request).rstrip(b"\0").hex() for request in device.requests]
+
+
+def test_set_lcd_brightness_reads_settings_before_writing_them(mock_ryujin3):
+    with mock_ryujin3.connect():
+        mock_ryujin3.set_screen(channel="lcd", mode="brightness", value="30")
+
+    assert _lcd_requests(mock_ryujin3.device) == [
+        "ecdc",
+        "ec5c0100001e0000001e14000000001e14",
+    ]
+
+
+def test_set_lcd_off_only_changes_the_display_mode(mock_ryujin3):
+    with mock_ryujin3.connect():
+        mock_ryujin3.set_screen(channel="lcd", mode="off", value=None)
+
+    assert _lcd_requests(mock_ryujin3.device) == ["ec51"]
+
+
+def test_set_lcd_text_uses_the_firmware_text_layout(mock_ryujin3):
+    with mock_ryujin3.connect():
+        mock_ryujin3.set_screen(channel="lcd", mode="text", value="Liquid=34.0℃")
+
+    requests = _lcd_requests(mock_ryujin3.device)
+    # as sent by the vendor software: an 18 byte label followed by the UTF-8 value
+    assert requests[0] == "ec5f00004c697175696400000000000000000000000033342e30e28483"
+    assert requests[1] == "ec5e000000000101ffffff00ffffff01ffffff00ffffff01ffffff00ffffff"
+    assert requests[2] == "ec5d0001210001000005"
+    assert requests[3] == "ec511f"
+
+
+def test_set_lcd_text_requires_a_label_and_a_value(mock_ryujin3):
+    with mock_ryujin3.connect():
+        with pytest.raises(ValueError, match="LABEL=VALUE"):
+            mock_ryujin3.set_screen(channel="lcd", mode="text", value="no separator")
+
+    assert not mock_ryujin3.device.requests
+
+
+def test_stored_static_screen_uploads_a_jpeg_in_padded_blocks(mock_ryujin3, tmp_path, monkeypatch):
+    monkeypatch.setattr("liquidctl.driver.asus_ryujin._LCD_STORED_PREPARE_DELAY", 0)
+    path = tmp_path / "noise.png"
+    Image.effect_noise((640, 480), 64).save(path)
+    expected = _prepare_lcd_stored_image(path)
+    assert len(expected) > 4096 and len(expected) % 4096
+    mock_ryujin3.device.lcd_mode = 0x11
+    bulk_device = _AcknowledgingBulkDevice(
+        mock_ryujin3.device, vendor_id=0x0B05, product_id=0x1BCB
+    )
+    mock_ryujin3._bulk_device = bulk_device
+
+    with mock_ryujin3.connect():
+        mock_ryujin3.set_screen(channel="lcd", mode="stored-static", value=path)
+
+    size = len(expected).to_bytes(3, byteorder="little").hex()
+    assert _lcd_requests(mock_ryujin3.device) == [
+        "ecd0",
+        "ec710101",
+        "ecf1",
+        "ec720101",
+        "ec7301",
+        bytes.fromhex(f"ec7f02{size}").rstrip(b"\0").hex(),
+        "ec73ff",
+        "ec5d0001110100000005",
+        "ec511101",
+        "ecd0",
+    ]
+    blocks = [data for _, endpoint, data in bulk_device._sent_xfers if endpoint == 0x02]
+    assert all(len(block) == 4096 for block in blocks)
+    assert b"".join(blocks)[: len(expected)] == expected
+    assert not any(b"".join(blocks)[len(expected) :])
+
+
+def test_stored_gif_screen_uploads_a_motion_jpeg_avi(mock_ryujin3, tmp_path, monkeypatch):
+    monkeypatch.setattr("liquidctl.driver.asus_ryujin._LCD_STORED_PREPARE_DELAY", 0)
+    path = tmp_path / "blink.gif"
+    frames = [Image.new("RGB", (64, 48), color) for color in ("red", "blue", "green")]
+    frames[0].save(path, save_all=True, append_images=frames[1:], duration=100, loop=0)
+    mock_ryujin3.device.lcd_mode = 0x11
+    bulk_device = _AcknowledgingBulkDevice(
+        mock_ryujin3.device, vendor_id=0x0B05, product_id=0x1BCB
+    )
+    mock_ryujin3._bulk_device = bulk_device
+
+    with mock_ryujin3.connect():
+        mock_ryujin3.set_screen(channel="lcd", mode="stored-gif", value=path)
+
+    requests = _lcd_requests(mock_ryujin3.device)
+    assert requests[3] == "ec7201"
+    assert requests[-3:] == ["ec5d0001140100000001", "ec511401", "ecd0"]
+    uploaded = b"".join(data for _, endpoint, data in bulk_device._sent_xfers if endpoint == 0x02)
+    assert uploaded[:4] == b"RIFF" and uploaded[8:12] == b"AVI "
+
+
+def test_stored_screen_without_a_file_shows_what_the_cooler_already_holds(mock_ryujin3):
+    with mock_ryujin3.connect():
+        mock_ryujin3.set_screen(channel="lcd", mode="stored-gif", value=None)
+
+    assert _lcd_requests(mock_ryujin3.device) == ["ec5d0001140100000001", "ec511401", "ecd0"]
+
+
+def test_failed_lcd_upload_closes_the_transfer_exactly_once(mock_ryujin3, tmp_path, monkeypatch):
+    # ending a transfer that is not open makes the cooler reboot
+    monkeypatch.setattr("liquidctl.driver.asus_ryujin._LCD_STORED_PREPARE_DELAY", 0)
+    monkeypatch.setattr("liquidctl.driver.asus_ryujin._LCD_NOTIFY_TIMEOUT_MS", 50)
+    path = tmp_path / "red.png"
+    Image.new("RGB", (640, 480), "red").save(path)
+    # a bulk interface that never acknowledges its blocks
+    mock_ryujin3._bulk_device = MockPyusbDevice(vendor_id=0x0B05, product_id=0x1BCB)
+
+    with mock_ryujin3.connect():
+        with pytest.raises(Timeout):
+            mock_ryujin3.set_screen(channel="lcd", mode="stored-static", value=path)
+
+    assert _lcd_requests(mock_ryujin3.device).count("ec73ff") == 1
+
+
+def _blink_gif(tmp_path):
+    path = tmp_path / "blink.gif"
+    frames = [Image.new("RGB", (64, 48), color) for color in ("red", "blue")]
+    frames[0].save(path, save_all=True, append_images=frames[1:], duration=100, loop=0)
+    return path
+
+
+def test_stored_video_is_stopped_before_it_is_replaced(mock_ryujin3, tmp_path, monkeypatch):
+    # the cooler refuses to replace the video it is currently playing
+    monkeypatch.setattr("liquidctl.driver.asus_ryujin._LCD_STORED_PREPARE_DELAY", 0)
+    monkeypatch.setattr("liquidctl.driver.asus_ryujin._LCD_STORED_RETRY_DELAY", 0)
+    mock_ryujin3.device.lcd_mode = 0x14
+    mock_ryujin3._bulk_device = _AcknowledgingBulkDevice(
+        mock_ryujin3.device, vendor_id=0x0B05, product_id=0x1BCB
+    )
+
+    with mock_ryujin3.connect():
+        mock_ryujin3.set_screen(channel="lcd", mode="stored-gif", value=_blink_gif(tmp_path))
+
+    assert _lcd_requests(mock_ryujin3.device)[:3] == ["ecd0", "ec51", "ec710101"]
+
+
+def test_refused_lcd_transfer_is_closed_without_sending_data(mock_ryujin3, tmp_path, monkeypatch):
+    monkeypatch.setattr("liquidctl.driver.asus_ryujin._LCD_STORED_PREPARE_DELAY", 0)
+    monkeypatch.setattr("liquidctl.driver.asus_ryujin._LCD_STORED_RETRY_DELAY", 0)
+    mock_ryujin3.device.lcd_mode = 0x11
+    mock_ryujin3.device.refuse_transfers = 100
+    bulk_device = _AcknowledgingBulkDevice(
+        mock_ryujin3.device, vendor_id=0x0B05, product_id=0x1BCB
+    )
+    mock_ryujin3._bulk_device = bulk_device
+
+    with mock_ryujin3.connect():
+        with pytest.raises(ExpectationNotMet):
+            mock_ryujin3.set_screen(channel="lcd", mode="stored-gif", value=_blink_gif(tmp_path))
+
+    requests = _lcd_requests(mock_ryujin3.device)
+    # every refused attempt is closed, and nothing is closed twice
+    assert requests.count("ec7301") == requests.count("ec73ff") == 6
+    assert requests[-2:] == ["ec7301", "ec73ff"]
+    assert not bulk_device._sent_xfers
+
+
+def test_refused_lcd_transfer_is_retried(mock_ryujin3, tmp_path, monkeypatch):
+    # a video that was just playing is released a moment after the mode change
+    monkeypatch.setattr("liquidctl.driver.asus_ryujin._LCD_STORED_PREPARE_DELAY", 0)
+    monkeypatch.setattr("liquidctl.driver.asus_ryujin._LCD_STORED_RETRY_DELAY", 0)
+    mock_ryujin3.device.lcd_mode = 0x14
+    mock_ryujin3.device.refuse_transfers = 2
+    bulk_device = _AcknowledgingBulkDevice(
+        mock_ryujin3.device, vendor_id=0x0B05, product_id=0x1BCB
+    )
+    mock_ryujin3._bulk_device = bulk_device
+
+    with mock_ryujin3.connect():
+        mock_ryujin3.set_screen(channel="lcd", mode="stored-gif", value=_blink_gif(tmp_path))
+
+    requests = _lcd_requests(mock_ryujin3.device)
+    assert requests.count("ec7301") == 3
+    assert requests.count("ec73ff") == 3
+    assert bulk_device._sent_xfers
+    assert requests[-3:-1] == ["ec5d0001140100000001", "ec511401"]
+
+
+def test_stored_video_the_player_cannot_parse_is_reported(mock_ryujin3, tmp_path, monkeypatch):
+    # a hung player leaves the display mode unchanged
+    monkeypatch.setattr("liquidctl.driver.asus_ryujin._LCD_STORED_PREPARE_DELAY", 0)
+    monkeypatch.setattr("liquidctl.driver.asus_ryujin._LCD_MODE_CHANGE_TIMEOUT", 0)
+    mock_ryujin3.device.lcd_mode = 0x11
+    mock_ryujin3.device.player_hangs = True
+    mock_ryujin3._bulk_device = _AcknowledgingBulkDevice(
+        mock_ryujin3.device, vendor_id=0x0B05, product_id=0x1BCB
+    )
+
+    with mock_ryujin3.connect():
+        with pytest.raises(ExpectationNotMet):
+            mock_ryujin3.set_screen(channel="lcd", mode="stored-gif", value=_blink_gif(tmp_path))
+
+
+def test_motion_jpeg_avi_matches_the_layout_of_vendor_uploads():
+    # the cooler's player hangs on an AVI whose frame data starts elsewhere
+    avi = _build_mjpeg_avi([b"\xff\xd8\xff\xd9"] * 3, fps=10)
+
+    assert avi.index(b"LIST", 12) == 0x0C and avi[0x14:0x18] == b"hdrl"
+    assert int.from_bytes(avi[0x10:0x14], "little") == 4588
+    assert avi[0x1200:0x1204] == b"LIST" and avi[0x1208:0x120C] == b"INFO"
+    assert avi[0x1622:0x1626] == b"LIST" and avi[0x162A:0x162E] == b"movi"
+    assert int.from_bytes(avi[0x2C:0x30], "little") == 0x910  # flags
+
+
+def test_invalid_stored_asset_does_not_start_a_transfer(mock_ryujin3, tmp_path):
+    with mock_ryujin3.connect():
+        with pytest.raises(ValueError, match="invalid stored-static configuration"):
+            mock_ryujin3.set_screen(
+                channel="lcd", mode="stored-static", value=tmp_path / "missing.png"
+            )
+
+    assert not mock_ryujin3.device.requests
+
+
+def test_stored_animation_is_a_valid_motion_jpeg_avi(tmp_path):
+    path = tmp_path / "blink.gif"
+    frames = [Image.new("RGB", (64, 48), color) for color in ("red", "blue")]
+    frames[0].save(path, save_all=True, append_images=frames[1:], duration=50, loop=0)
+
+    avi = _prepare_lcd_stored_animation(path)
+
+    assert avi[:4] == b"RIFF" and avi[8:12] == b"AVI "
+    assert int.from_bytes(avi[4:8], "little") == len(avi) - 8
+    # main header: frame period for 20 fps, frame count and native resolution
+    assert int.from_bytes(avi[32:36], "little") == 50_000
+    assert int.from_bytes(avi[48:52], "little") == 2
+    assert int.from_bytes(avi[64:68], "little") == 640
+    assert int.from_bytes(avi[68:72], "little") == 480
+    # each frame once in the data and once in the index, plus the reserved index space
+    assert avi.count(b"00dc") == 5
+    assert avi.count(b"\xff\xd8\xff") == 2
+
+
+def test_motion_jpeg_avi_pads_odd_sized_frames():
+    avi = _build_mjpeg_avi([b"\xff\xd8\xff", b"\xff\xd8"], fps=10)
+
+    assert len(avi) % 2 == 0
+    assert int.from_bytes(avi[4:8], "little") == len(avi) - 8
 
 
 @pytest.mark.parametrize("mode", ["static", "gif"])
