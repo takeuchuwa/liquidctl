@@ -155,9 +155,13 @@ the file already stored:
 # liquidctl set lcd screen stored-gif
 ```
 
-The cooler does not keep the stored files across a full power cycle (they do
-survive a warm reboot), so they have to be uploaded again after the computer
-is switched on.
+The stored files survive a full power cycle, but the cooler then shows its
+default animation again.  To restore the display after the computer is switched
+on, select the stored file without uploading it again:
+
+```
+# liquidctl set lcd screen stored-gif
+```
 
 Replacing an animation that is currently playing blanks the display for a
 moment, because the cooler refuses to overwrite a file it is playing.  If an

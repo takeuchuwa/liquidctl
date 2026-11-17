@@ -94,8 +94,11 @@ it is not acknowledged and the cooler reboots (the device disconnects from
 USB and its fans briefly run at full speed).  A transfer interrupted after
 step 4 must still be closed.
 
-Stored files are lost when the cooler loses power but survive a warm reboot
-of the computer.
+Stored files survive a power cycle of the cooler; only the display mode is
+reset, to the default animation (`EC D0` reports mode `14` with argument `00`).
+The free space reported by `EC F1` (bytes 8–11, little endian, in KiB; bytes
+4–7 hold the total) shows whether a file is still present.  Querying it with
+`EC 71 01 01` followed by `EC F1`, without opening a transfer, is harmless.
 
 Behaviour observed on firmware `AURJ3-S5F9-0104`:
 
